@@ -2,6 +2,7 @@ import os
 import sys
 import re
 import time
+import json
 import asyncio
 import secrets
 from typing import List, Tuple
@@ -40,12 +41,15 @@ app = Client(
     bot_token=BOT_TOKEN
 )
 
+# In-memory storage for active upload sessions
+UPLOAD_SESSIONS = {}
+
 def is_owner_filter(_, __, message: Message):
     return message.from_user and message.from_user.id == OWNER_ID
 
 is_owner = filters.create(is_owner_filter)
 
-# ==================== HELPERS & FORMATTING ====================
+# ==================== HELPERS & STYLING ====================
 CHARMAP = {
     'a': 'ᴀ', 'b': 'ʙ', 'c': 'ᴄ', 'd': 'ᴅ', 'e': 'ᴇ', 'f': 'ғ', 'g': 'ɢ', 'h': 'ʜ',
     'i': 'ɪ', 'j': 'ᴊ', 'k': 'ᴋ', 'l': 'ʟ', 'm': 'ᴍ', 'n': 'ɴ', 'o': 'ᴏ', 'p': 'ᴘ',
@@ -54,7 +58,7 @@ CHARMAP = {
 }
 
 def to_small_caps(text: str) -> str:
-    """Converts text to Small Caps while keeping slash commands and URLs raw & clickable."""
+    """Converts alphabets to Small Caps while keeping slash commands and URLs clickable."""
     if not text:
         return ""
     tokens = re.split(r'(\s+)', text)
@@ -74,7 +78,6 @@ def paginate_elements(items: List[Tuple[int, str]], page: int = 1, page_size: in
     total_items = len(items)
     total_pages = max(1, (total_items + page_size - 1) // page_size)
     page = max(1, min(page, total_pages))
-    
     start_idx = (page - 1) * page_size
     page_items = items[start_idx:start_idx + page_size]
     
@@ -124,6 +127,14 @@ async def init_db():
                 db_msg_id INTEGER,
                 file_name TEXT,
                 file_type TEXT,
+                is_premium INTEGER DEFAULT 0,
+                created_at INTEGER
+            )
+        """)
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS batches (
+                batch_id TEXT PRIMARY KEY,
+                file_ids TEXT,
                 is_premium INTEGER DEFAULT 0,
                 created_at INTEGER
             )
@@ -238,6 +249,147 @@ def back_close_markup(back_to: str = "cb_start"):
         ]
     ])
 
+# ==================== NEW 4-COMMAND UPLOAD SYSTEM ====================
+
+@app.on_message(filters.command("upload") & filters.private & is_owner)
+async def start_regular_upload(client: Client, message: Message):
+    UPLOAD_SESSIONS[message.from_user.id] = {"is_premium": 0, "messages": []}
+    text = (
+        "📥 <b>ᴜᴘʟᴏᴀᴅ ᴍᴏᴅᴇ ᴀᴄᴛɪᴠᴀᴛᴇᴅ</b>\n\n"
+        "<blockquote>"
+        "• sᴇɴᴅ ᴀʟʟ ᴛʜᴇ ғɪʟᴇs ʏᴏᴜ ᴡᴀɴɴᴀ ᴀᴅᴅ.\n"
+        "• ᴡʜᴇɴ ᴅᴏɴᴇ, sᴇɴᴅ /finish ᴛᴏ sᴀᴠᴇ & ɢᴇᴛ ʟɪɴᴋs.\n"
+        "• ᴏʀ sᴇɴᴅ /cancel_upload ᴛᴏ ᴄᴀɴᴄᴇʟ."
+        "</blockquote>"
+    )
+    await message.reply_text(text)
+
+@app.on_message(filters.command("premium_upload") & filters.private & is_owner)
+async def start_premium_upload(client: Client, message: Message):
+    UPLOAD_SESSIONS[message.from_user.id] = {"is_premium": 1, "messages": []}
+    text = (
+        "💎 <b>ᴠɪᴘ ᴜᴘʟᴏᴀᴅ ᴍᴏᴅᴇ ᴀᴄᴛɪᴠᴀᴛᴇᴅ</b>\n\n"
+        "<blockquote>"
+        "• sᴇɴᴅ ᴀʟʟ ᴛʜᴇ ᴠɪᴘ ғɪʟᴇs ʏᴏᴜ ᴡᴀɴɴᴀ ᴀᴅᴅ.\n"
+        "• ᴡʜᴇɴ ᴅᴏɴᴇ, sᴇɴᴅ /premium_finish ᴛᴏ sᴀᴠᴇ & ɢᴇᴛ ᴠɪᴘ ʟɪɴᴋ.\n"
+        "• ᴏʀ sᴇɴᴅ /cancel_upload ᴛᴏ ᴄᴀɴᴄᴇʟ."
+        "</blockquote>"
+    )
+    await message.reply_text(text)
+
+@app.on_message(filters.command("cancel_upload") & filters.private & is_owner)
+async def cancel_upload_cmd(client: Client, message: Message):
+    if message.from_user.id in UPLOAD_SESSIONS:
+        del UPLOAD_SESSIONS[message.from_user.id]
+        await message.reply_text(to_small_caps("❌ ᴜᴘʟᴏᴀᴅ sᴇssɪᴏɴ ᴄᴀɴᴄᴇʟʟᴇᴅ!"))
+    else:
+        await message.reply_text(to_small_caps("ℹ️ ɴᴏ ᴀᴄᴛɪᴠᴇ ᴜᴘʟᴏᴀᴅ sᴇssɪᴏɴ."))
+
+# Capture incoming files during an active session
+@app.on_message(filters.private & is_owner & (filters.document | filters.video | filters.audio | filters.photo))
+async def capture_incoming_files(client: Client, message: Message):
+    user_id = message.from_user.id
+    if user_id not in UPLOAD_SESSIONS:
+        return
+
+    UPLOAD_SESSIONS[user_id]["messages"].append(message)
+    count = len(UPLOAD_SESSIONS[user_id]["messages"])
+    fname = "ᴍᴇᴅɪᴀ"
+    if message.document and message.document.file_name:
+        fname = message.document.file_name
+    elif message.video and message.video.file_name:
+        fname = message.video.file_name
+
+    mode = "💎 ᴠɪᴘ" if UPLOAD_SESSIONS[user_id]["is_premium"] else "📥"
+    await message.reply_text(
+        f"<blockquote>{mode} <b>ғɪʟᴇ #{count} ʀᴇᴄᴇɪᴠᴇᴅ:</b> {fname}\n<i>sᴇɴᴅ ᴍᴏʀᴇ ᴏʀ sᴇɴᴅ /finish (/premium_finish)</i></blockquote>"
+    )
+
+# Save files and generate shareable links
+@app.on_message(filters.command(["finish", "premium_finish"]) & filters.private & is_owner)
+async def finish_upload_cmd(client: Client, message: Message):
+    user_id = message.from_user.id
+    session = UPLOAD_SESSIONS.get(user_id)
+
+    if not session:
+        return await message.reply_text(to_small_caps("⚠️ ɴᴏ ᴀᴄᴛɪᴠᴇ ᴜᴘʟᴏᴀᴅ sᴇssɪᴏɴ! sᴇɴᴅ /upload ᴏʀ /premium_upload ғɪʀsᴛ."))
+
+    msg_list = session["messages"]
+    if not msg_list:
+        return await message.reply_text(to_small_caps("⚠️ ɴᴏ ғɪʟᴇs ᴡᴇʀᴇ sᴇɴᴛ ʏᴇᴛ! sᴇɴᴅ ғɪʟᴇs ғɪʀsᴛ ᴏʀ /cancel_upload"))
+
+    is_prem = session["is_premium"]
+    p_msg = await message.reply_text(to_small_caps(f"⏳ ᴘʀᴏᴄᴇssɪɴɢ & sᴀᴠɪɴɢ {len(msg_list)} ғɪʟᴇ(s) ᴛᴏ ᴅʙ..."))
+
+    saved_file_ids = []
+    first_file_name = "ʙᴜɴᴅʟᴇ"
+
+    for msg in msg_list:
+        try:
+            copied = await msg.copy(DB_CHANNEL)
+        except Exception as e:
+            await p_msg.edit_text(
+                f"<blockquote>❌ <b>ᴇʀʀᴏʀ:</b> ᴄᴀɴɴᴏᴛ ᴄᴏᴘʏ ᴛᴏ ᴅʙ ᴄʜᴀɴɴᴇʟ.\n"
+                f"ᴍᴀᴋᴇ sᴜʀᴇ ʙᴏᴛ ɪs ᴀɴ <b>ᴀᴅᴍɪɴɪsᴛʀᴀᴛᴏʀ</b> ɪɴ ᴄʜᴀɴɴᴇʟ <code>{DB_CHANNEL}</code>!\n"
+                f"<i>Details: {e}</i></blockquote>"
+            )
+            return
+
+        file_key = secrets.token_urlsafe(8)
+        fname = "ᴍᴇᴅɪᴀ"
+        if msg.document and msg.document.file_name:
+            fname = msg.document.file_name
+        elif msg.video and msg.video.file_name:
+            fname = msg.video.file_name
+
+        if not saved_file_ids:
+            first_file_name = fname
+
+        async with aiosqlite.connect(DATABASE_NAME) as db:
+            await db.execute("""
+                INSERT INTO files (file_id, db_msg_id, file_name, file_type, is_premium, created_at)
+                VALUES (?, ?, ?, ?, ?, ?)
+            """, (file_key, copied.id, fname, "media", is_prem, int(time.time())))
+            await db.commit()
+
+        saved_file_ids.append(file_key)
+
+    bot_user = (await client.get_me()).username
+    del UPLOAD_SESSIONS[user_id]
+
+    # If 1 file was uploaded
+    if len(saved_file_ids) == 1:
+        share_url = f"https://t.me/{bot_user}?start=file_{saved_file_ids[0]}"
+        badge = "💎 ᴠɪᴘ ʟɪɴᴋ" if is_prem else "⚡ ғɪʟᴇ ʟɪɴᴋ"
+        res_text = (
+            f"<b>{to_small_caps(badge)} ɢᴇɴᴇʀᴀᴛᴇᴅ!</b>\n\n"
+            f"<blockquote>📁 <b>{to_small_caps('ɴᴀᴍᴇ')}:</b> {first_file_name}\n"
+            f"🔗 <b>ʟɪɴᴋ:</b> <code>{share_url}</code></blockquote>"
+        )
+    # If multiple files were uploaded (Batch)
+    else:
+        batch_key = secrets.token_urlsafe(8)
+        async with aiosqlite.connect(DATABASE_NAME) as db:
+            await db.execute("""
+                INSERT INTO batches (batch_id, file_ids, is_premium, created_at)
+                VALUES (?, ?, ?, ?)
+            """, (batch_key, json.dumps(saved_file_ids), is_prem, int(time.time())))
+            await db.commit()
+
+        share_url = f"https://t.me/{bot_user}?start=batch_{batch_key}"
+        badge = "💎 ᴠɪᴘ ʙᴀᴛᴄʜ ʟɪɴᴋ" if is_prem else "⚡ ʙᴀᴛᴄʜ ʟɪɴᴋ"
+        res_text = (
+            f"<b>{to_small_caps(badge)} ɢᴇɴᴇʀᴀᴛᴇᴅ!</b>\n\n"
+            f"<blockquote>📦 <b>{to_small_caps('ᴛᴏᴛᴀʟ ғɪʟᴇs')}:</b> {len(saved_file_ids)}\n"
+            f"🔗 <b>ʙᴀᴛᴄʜ ʟɪɴᴋ:</b> <code>{share_url}</code></blockquote>"
+        )
+
+    markup = InlineKeyboardMarkup([
+        [btn("📋 sʜᴀʀᴇ ʟɪɴᴋ", url=f"https://t.me/share/url?url={share_url}")],
+        [btn("❌ ᴄʟᴏsᴇ", callback_data="close_msg")]
+    ])
+    await p_msg.edit_text(res_text, reply_markup=markup)
+
 # ==================== CORE /START & RETRIEVAL ====================
 @app.on_message(filters.command("start") & filters.private)
 async def start_handler(client: Client, message: Message):
@@ -271,6 +423,7 @@ async def start_handler(client: Client, message: Message):
             except Exception:
                 pass
 
+        # Handle Single File
         if param.startswith("file_"):
             file_key = param.replace("file_", "")
             async with aiosqlite.connect(DATABASE_NAME) as db:
@@ -301,6 +454,49 @@ async def start_handler(client: Client, message: Message):
                 asyncio.create_task(auto_delete_task(client, user_id, [copied.id, timer_msg.id], auto_del_secs))
             return
 
+        # Handle Batch Link
+        elif param.startswith("batch_"):
+            batch_key = param.replace("batch_", "")
+            async with aiosqlite.connect(DATABASE_NAME) as db:
+                db.row_factory = aiosqlite.Row
+                async with db.execute("SELECT * FROM batches WHERE batch_id = ?", (batch_key,)) as c:
+                    b_row = await c.fetchone()
+
+            if not b_row:
+                return await message.reply_text(to_small_caps("❌ ʙᴀᴛᴄʜ ɴᴏᴛ ғᴏᴜɴᴅ ᴏʀ ᴇxᴘɪʀᴇᴅ."))
+
+            if b_row["is_premium"] and not is_vip and user_id != OWNER_ID:
+                vip_alert = to_small_caps("💎 ᴛʜɪs ʙᴀᴛᴄʜ ɪs ᴇxᴄʟᴜsɪᴠᴇ ᴛᴏ ᴠɪᴘ ᴍᴇᴍʙᴇʀs.\nᴜsᴇ /vip ᴏʀ ᴄᴏɴᴛᴀᴄᴛ ᴀᴅᴍɪɴ ᴛᴏ ᴜᴘɢʀᴀᴅᴇ!")
+                return await message.reply_text(f"<blockquote>{vip_alert}</blockquote>")
+
+            f_ids = json.loads(b_row["file_ids"])
+            sent_msgs = []
+            protect = (await get_setting("protect_content", "1")) == "1"
+
+            for fid in f_ids:
+                async with aiosqlite.connect(DATABASE_NAME) as db:
+                    db.row_factory = aiosqlite.Row
+                    async with db.execute("SELECT db_msg_id FROM files WHERE file_id = ?", (fid,)) as c:
+                        f_info = await c.fetchone()
+                if f_info:
+                    cp = await client.copy_message(
+                        chat_id=user_id,
+                        from_chat_id=DB_CHANNEL,
+                        message_id=f_info["db_msg_id"],
+                        protect_content=protect
+                    )
+                    sent_msgs.append(cp.id)
+
+            auto_del_secs = int(await get_setting("auto_delete", "600"))
+            if auto_del_secs > 0:
+                t_msg = await message.reply_text(
+                    to_small_caps(f"⏳ ᴛʜᴇsᴇ ғɪʟᴇs ᴡɪʟʟ ᴀᴜᴛᴏ-ᴅᴇʟᴇᴛᴇ ɪɴ {auto_del_secs // 60} ᴍɪɴᴜᴛᴇs!")
+                )
+                sent_msgs.append(t_msg.id)
+                asyncio.create_task(auto_delete_task(client, user_id, sent_msgs, auto_del_secs))
+            return
+
+    # Regular Start View
     banner_url = await get_setting("image_url", DEFAULT_IMAGE)
     start_text = await get_setting("start_text")
     footer_text = await get_setting("footer_text")
@@ -403,46 +599,7 @@ async def callback_router(client: Client, query: CallbackQuery):
         await query.answer("✅ ᴠɪᴘ ɢʀᴀɴᴛᴇᴅ sᴜᴄᴄᴇssғᴜʟʟʏ!", show_alert=True)
         await query.message.edit_text(to_small_caps(f"✅ ᴠɪᴘ ᴀᴄᴄᴇss ɢʀᴀɴᴛᴇᴅ ᴛᴏ ᴜsᴇʀ {uid}!"))
 
-# ==================== FILE STORAGE COMMANDS ====================
-@app.on_message(filters.command(["upload", "link", "premium_link"]) & filters.private & is_owner)
-async def upload_file_handler(client: Client, message: Message):
-    is_prem = 1 if "premium" in message.command[0] else 0
-    replied = message.reply_to_message
-    if not replied or not (replied.document or replied.video or replied.audio or replied.photo):
-        return await message.reply_text(to_small_caps("⚠️ ᴘʟᴇᴀsᴇ ʀᴇᴘʟʏ ᴛᴏ ᴀ ᴠɪᴅᴇᴏ, ᴅᴏᴄᴜᴍᴇɴᴛ, ᴏʀ ᴀᴜᴅɪᴏ!"))
-
-    copied = await replied.copy(DB_CHANNEL)
-    file_key = secrets.token_urlsafe(8)
-    
-    fname = "ᴍᴇᴅɪᴀ"
-    if replied.document and replied.document.file_name:
-        fname = replied.document.file_name
-    elif replied.video and replied.video.file_name:
-        fname = replied.video.file_name
-
-    async with aiosqlite.connect(DATABASE_NAME) as db:
-        await db.execute("""
-            INSERT INTO files (file_id, db_msg_id, file_name, file_type, is_premium, created_at)
-            VALUES (?, ?, ?, ?, ?, ?)
-        """, (file_key, copied.id, fname, "media", is_prem, int(time.time())))
-        await db.commit()
-
-    bot_user = (await client.get_me()).username
-    share_url = f"https://t.me/{bot_user}?start=file_{file_key}"
-    badge = "💎 ᴠɪᴘ ʟɪɴᴋ" if is_prem else "⚡ ғɪʟᴇ ʟɪɴᴋ"
-    
-    res_text = (
-        f"<b>{to_small_caps(badge)} ɢᴇɴᴇʀᴀᴛᴇᴅ!</b>\n\n"
-        f"<blockquote>📁 <b>{to_small_caps('ɴᴀᴍᴇ')}:</b> {fname}\n"
-        f"🔗 <b>ʟɪɴᴋ:</b> <code>{share_url}</code></blockquote>"
-    )
-    markup = InlineKeyboardMarkup([
-        [btn("📋 sʜᴀʀᴇ ʟɪɴᴋ", url=f"https://t.me/share/url?url={share_url}")],
-        [btn("❌ ᴄʟᴏsᴇ", callback_data="close_msg")]
-    ])
-    await message.reply_text(res_text, reply_markup=markup)
-
-# ==================== COLLECTIONS COMMANDS ====================
+# ==================== COLLECTIONS & ADMIN COMMANDS ====================
 @app.on_message(filters.command("collections") & filters.private)
 async def collections_cmd(client: Client, message: Message):
     async with aiosqlite.connect(DATABASE_NAME) as db:
@@ -466,7 +623,6 @@ async def new_collection_cmd(client: Client, message: Message):
     except Exception as e:
         await message.reply_text(to_small_caps(f"❌ ᴇʀʀᴏʀ: {e}"))
 
-# ==================== VIP MANAGEMENT ====================
 @app.on_message(filters.command("premium") & filters.private & is_owner)
 async def premium_cmd(client: Client, message: Message):
     args = message.text.split()
@@ -503,7 +659,6 @@ async def user_info_cmd(client: Client, message: Message):
     )
     await message.reply_text(info)
 
-# ==================== LIVE CUSTOMIZATION ====================
 @app.on_message(filters.command("set_image") & filters.private & is_owner)
 async def set_image_cmd(client: Client, message: Message):
     args = message.text.split(maxsplit=1)
@@ -527,7 +682,7 @@ async def ping_cmd(client: Client, message: Message):
     delta = round((time.time() - start) * 1000, 2)
     await msg.edit_text(to_small_caps(f"🏓 ᴘᴏɴɢ: {delta}ᴍs"), reply_markup=back_close_markup("cb_start"))
 
-# ==================== WEB SERVER (RENDER PORT BINDING) ====================
+# ==================== RENDER / VPS WEB SERVER ====================
 async def web_server():
     async def handle_ping(request):
         return web.Response(text="ZShort Bot is Alive & Running Smoothly!")
@@ -538,15 +693,23 @@ async def web_server():
     await runner.setup()
     site = web.TCPSite(runner, "0.0.0.0", PORT)
     await site.start()
-    print(f"Render HTTP Web Server bound on port {PORT}")
+    print(f"Web server running on port {PORT}")
 
-# ==================== ASYNC MAIN & RESILIENT RUNNER ====================
+# ==================== RUNNER ====================
 async def main():
     await init_db()
     print("Database Initialized.")
     await web_server()
     await app.start()
-    print("ZShort Bot Started Successfully on Render!")
+    
+    # Pre-cache DB channel
+    try:
+        chat = await app.get_chat(DB_CHANNEL)
+        print(f"Successfully connected to DB Channel: {chat.title} ({DB_CHANNEL})")
+    except Exception as e:
+        print(f"⚠️ WARNING: Bot cannot access DB_CHANNEL ({DB_CHANNEL}). Ensure Bot is an ADMIN in the channel! Error: {e}")
+
+    print("ZShort Bot is Online!")
     await idle()
     await app.stop()
 
